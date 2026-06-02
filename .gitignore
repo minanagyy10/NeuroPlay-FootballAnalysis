@@ -1,7 +1,11 @@
-venv/
-.venv/
-__pycache__/
-*.pyc
-.env
-runs/
+*.mp4
+*.avi
+*.mkv
+*.mov
 output/
+venv/
+__pycache__/
+*.pt
+runs/
+football-players-detection-1/
+.venv/
