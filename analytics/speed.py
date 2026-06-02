@@ -32,7 +32,7 @@ from tracking.tracker import TrackState
 @dataclass
 class SpeedConfig:
     smooth_window:  int   = 5      # rolling median window for speed noise removal
-    max_speed_kmh:  float = 40.0   # discard spikes above this (tracking errors)
+    max_speed_kmh:  float = 32.0   # discard spikes above this (tracking errors)
     min_dt:         float = 0.02   # minimum seconds between samples (avoids /0)
 
 

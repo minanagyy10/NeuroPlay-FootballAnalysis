@@ -8,6 +8,9 @@ Quick-start script. Edit the paths below and run:
 For the API server:
     uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 """
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 from pipeline import FootballPipeline, PipelineConfig
@@ -15,7 +18,7 @@ from pipeline import FootballPipeline, PipelineConfig
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1: Set your video path
 # ─────────────────────────────────────────────────────────────────────────────
-VIDEO_PATH = "match.mp4"
+VIDEO_PATH = "newmatch.mp4"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2: Camera calibration
@@ -36,7 +39,7 @@ world_pts = None   # Example: np.array([[0, 68], [105, 68], [0, 0], [105, 0]],  
 cfg = PipelineConfig(
     video_path        = VIDEO_PATH,
     output_path       = "output/annotated.mp4",
-    model_path        = "yolov8x.pt",     # swap with custom football .pt for best results
+    model_path        = r"runs\detect\runs\train\football_ball-3\weights\best.pt",     # swap with custom football .pt for best results
     device            = "cuda",           # or "cpu"
     pixel_pts         = pixel_pts,
     world_pts         = world_pts,

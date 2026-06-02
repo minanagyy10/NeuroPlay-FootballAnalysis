@@ -1,12 +1,3 @@
-"""
-tracking/tracker.py
-───────────────────
-Multi-object tracking using ByteTrack (via supervision).
-
-Maintains separate trackers for players and ball so their IDs don't collide.
-Stores per-ID position history for speed estimation + heatmaps.
-"""
-
 from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -18,14 +9,11 @@ import supervision as sv
 from detection.detector import FrameDetections
 
 
-# ─── Data Classes ─────────────────────────────────────────────────────────────
-
 @dataclass
 class TrackState:
-    """Accumulated state for one tracked entity."""
     track_id:    int
-    positions:   List[Tuple[float, float]] = field(default_factory=list)   # (cx, cy) in pixels
-    timestamps:  List[float]               = field(default_factory=list)   # seconds
+    positions:   List[Tuple[float, float]] = field(default_factory=list)
+    timestamps:  List[float]               = field(default_factory=list)
     frame_idxs:  List[int]                = field(default_factory=list)
     is_ball:     bool                      = False
 
@@ -42,57 +30,39 @@ class TrackState:
 
 @dataclass
 class TrackedFrame:
-    """Output from the tracker for one frame."""
-    players:     sv.Detections
-    ball:        sv.Detections
-    frame_index: int
-    timestamp_s: float
-    # raw pixel positions (cx, cy) keyed by tracker_id
+    players:        sv.Detections
+    ball:           sv.Detections
+    frame_index:    int
+    timestamp_s:    float
     player_centers: Dict[int, Tuple[float, float]] = field(default_factory=dict)
     ball_center:    Optional[Tuple[float, float]]  = None
 
 
-# ─── Tracker ──────────────────────────────────────────────────────────────────
-
 class FootballTracker:
-    """
-    Wraps ByteTrack for two independent object classes:
-    - Players  (stable, many objects)
-    - Ball     (one object, fast, frequently occluded)
-
-    Usage
-    -----
-    tracker = FootballTracker()
-    for fd in detector.iter_video("match.mp4"):
-        tf = tracker.update(fd)
-        # tf.players.tracker_id  → array of stable IDs
-        # tf.ball_center         → (cx, cy) or None
-    """
 
     def __init__(
         self,
-        frame_rate:        int   = 25,
-        track_thresh:      float = 0.45,
-        track_buffer:      int   = 30,   # frames to keep lost tracks alive
-        match_thresh:      float = 0.8,
+        frame_rate:   int   = 25,
+        match_thresh: float = 0.8,
+        track_buffer: int   = 90,
     ):
-        kwargs = dict(
-            track_thresh=track_thresh,
-            track_buffer=track_buffer,
-            match_thresh=match_thresh,
+        self._player_tracker = sv.ByteTrack(
+            minimum_matching_threshold=match_thresh,
+            lost_track_buffer=track_buffer,
+            minimum_consecutive_frames=2,
             frame_rate=frame_rate,
         )
-        self._player_tracker = sv.ByteTracker(**kwargs)
-        self._ball_tracker   = sv.ByteTracker(**kwargs)
+        self._ball_tracker = sv.ByteTrack(
+            minimum_matching_threshold=match_thresh,
+            lost_track_buffer=track_buffer,
+            minimum_consecutive_frames=1,
+            frame_rate=frame_rate,
+        )
 
-        # history keyed by tracker_id
         self.player_states: Dict[int, TrackState] = {}
         self.ball_states:   Dict[int, TrackState] = {}
 
-    # ── Public API ──────────────────────────────────────────────────────────
-
     def update(self, fd: FrameDetections) -> TrackedFrame:
-        """Update tracker with one FrameDetections, returns TrackedFrame."""
         players = self._player_tracker.update_with_detections(fd.players)
         ball    = self._ball_tracker.update_with_detections(fd.ball)
 
@@ -100,7 +70,6 @@ class FootballTracker:
             players, self.player_states,
             fd.timestamp_s, fd.frame_index, is_ball=False
         )
-
         ball_centers = self._record(
             ball, self.ball_states,
             fd.timestamp_s, fd.frame_index, is_ball=True
@@ -123,17 +92,13 @@ class FootballTracker:
         return self.player_states.get(track_id)
 
     def all_player_positions(self) -> Dict[int, List[Tuple[float, float]]]:
-        """Return {track_id: [(cx, cy), …]} for heatmap generation."""
         return {tid: s.positions for tid, s in self.player_states.items()}
 
     def ball_trajectory(self) -> List[Tuple[float, float]]:
-        """Return list of all ball center positions (any track ID)."""
         positions = []
         for s in self.ball_states.values():
             positions.extend(s.positions)
         return positions
-
-    # ── Helpers ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _record(

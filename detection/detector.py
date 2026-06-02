@@ -1,66 +1,45 @@
-"""
-detection/detector.py
-─────────────────────
-Player & ball detection using YOLOv8.
-Supports both COCO-pretrained weights and custom football-tuned weights.
-"""
-
 from __future__ import annotations
 import numpy as np
 import cv2
 import supervision as sv
 from ultralytics import YOLO
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
-# ─── COCO class IDs ───────────────────────────────────────────────────────────
-PERSON_CLASS_ID      = 0
-SPORTS_BALL_CLASS_ID = 32
+# New model classes: 0=ball, 1=goalkeeper, 2=player, 3=referee
+BALL_CLASS_ID       = 0
+GOALKEEPER_CLASS_ID = 1
+PLAYER_CLASS_ID     = 2
+REFEREE_CLASS_ID    = 3
 
-# ─── Data Classes ─────────────────────────────────────────────────────────────
 
 @dataclass
 class DetectionConfig:
-    model_path: str  = "yolov8x.pt"   # swap with custom .pt for better ball detection
-    conf_player: float = 0.40
-    conf_ball:   float = 0.25          # lower → catches fast-moving ball more often
-    imgsz:       int   = 1280          # higher → better small-object (ball) detection
-    device:      str   = "cuda"        # "cpu" if no GPU
+    model_path:  str   = "yolov8x.pt"
+    conf_player: float = 0.45
+    conf_ball:   float = 0.10
+    imgsz:       int   = 1280
+    device:      str   = "cuda"
 
 
 @dataclass
 class FrameDetections:
-    players:      sv.Detections
-    ball:         sv.Detections
-    frame_index:  int
-    timestamp_s:  float
+    players:     sv.Detections
+    ball:        sv.Detections
+    frame_index: int
+    timestamp_s: float
 
-
-# ─── Detector ─────────────────────────────────────────────────────────────────
 
 class FootballDetector:
-    """
-    Wraps YOLOv8 for football-specific detection.
-
-    Usage
-    -----
-    detector = FootballDetector(DetectionConfig())
-    for frame_det in detector.iter_video("match.mp4"):
-        # frame_det.players  → sv.Detections
-        # frame_det.ball     → sv.Detections
-    """
 
     def __init__(self, config: DetectionConfig = DetectionConfig()):
         self.cfg   = config
         self.model = YOLO(config.model_path)
         print(f"[Detector] Loaded model: {config.model_path}")
 
-    # ── Public API ──────────────────────────────────────────────────────────
-
     def detect_frame(self, frame: np.ndarray, frame_index: int = 0,
                      fps: float = 25.0) -> FrameDetections:
-        """Run detection on a single BGR frame."""
         results = self.model(
             frame,
             imgsz=self.cfg.imgsz,
@@ -70,8 +49,12 @@ class FootballDetector:
 
         all_det = sv.Detections.from_ultralytics(results)
 
-        players = self._filter(all_det, PERSON_CLASS_ID,      self.cfg.conf_player)
-        ball    = self._filter(all_det, SPORTS_BALL_CLASS_ID, self.cfg.conf_ball)
+        players = self._filter_multi(
+            all_det,
+            [PLAYER_CLASS_ID, GOALKEEPER_CLASS_ID, REFEREE_CLASS_ID],
+            self.cfg.conf_player
+        )
+        ball = self._filter(all_det, BALL_CLASS_ID, self.cfg.conf_ball)
 
         return FrameDetections(
             players=players,
@@ -81,14 +64,6 @@ class FootballDetector:
         )
 
     def iter_video(self, video_path: str):
-        """
-        Generator — yields FrameDetections for every frame in the video.
-
-        Example
-        -------
-        for fd in detector.iter_video("match.mp4"):
-            print(fd.players)
-        """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise FileNotFoundError(f"Cannot open video: {video_path}")
@@ -106,13 +81,20 @@ class FootballDetector:
         finally:
             cap.release()
 
-    # ── Helpers ─────────────────────────────────────────────────────────────
-
     @staticmethod
     def _filter(detections: sv.Detections,
                 class_id: int,
                 min_conf: float) -> sv.Detections:
         mask = (detections.class_id == class_id)
+        if detections.confidence is not None:
+            mask &= (detections.confidence >= min_conf)
+        return detections[mask]
+
+    @staticmethod
+    def _filter_multi(detections: sv.Detections,
+                      class_ids: list,
+                      min_conf: float) -> sv.Detections:
+        mask = np.isin(detections.class_id, class_ids)
         if detections.confidence is not None:
             mask &= (detections.confidence >= min_conf)
         return detections[mask]
