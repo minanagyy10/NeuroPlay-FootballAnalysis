@@ -5,9 +5,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 import numpy as np
 import cv2
 
@@ -21,14 +21,15 @@ from tactical_ai.coach      import TacticalCoach, TacticalSituation
 from utils.annotator        import FootballAnnotator
 from utils.camera           import CameraAutoDetector
 from utils.reid             import ReIDSystem
+from utils.team_separator   import TeamSeparator
 
 
 @dataclass
 class PipelineConfig:
     video_path:        str
-    output_path:       str          = "output/annotated.mp4"
-    model_path:        str          = "yolov8x.pt"
-    device:            str          = "cuda"
+    output_path:       str  = "output/annotated.mp4"
+    model_path:        str  = "yolov8x.pt"
+    device:            str  = "cuda"
     pixel_pts:         Optional[np.ndarray] = None
     world_pts:         Optional[np.ndarray] = None
     save_heatmaps:     bool = True
@@ -60,13 +61,16 @@ class FootballPipeline:
         )
 
         self.detector       = FootballDetector(det_config)
-        self.tracker        = FootballTracker(
-            track_buffer=cam_profile.track_buffer,
-        )
+        self.tracker        = FootballTracker(track_buffer=cam_profile.track_buffer)
         self.reid           = ReIDSystem(
             color_threshold    = 0.55,
             position_threshold = 350.0,
             max_lost_frames    = 500,
+        )
+        self.team_separator = TeamSeparator(
+            n_clusters      = 3,
+            min_samples     = 50,
+            recluster_every = 1000,
         )
         self.calibrator     = self._setup_calibrator()
         self.speed_analyzer = SpeedAnalyzer(
@@ -107,10 +111,8 @@ class FootballPipeline:
                 ret, frame = cap.read()
                 if not ret:
                     break
-
                 if self.cfg.max_frames and frame_index >= self.cfg.max_frames:
                     break
-
                 if frame_index % self.cfg.frame_skip != 0:
                     frame_index += 1
                     continue
@@ -131,16 +133,26 @@ class FootballPipeline:
                         frame_index = frame_index,
                     )
 
-                # ── Speed + Heatmap using stable IDs ──────────────────────
+                # ── Team separation ───────────────────────────────────────
+                if tf.players.tracker_id is not None and len(tf.players) > 0:
+                    for box, tid in zip(tf.players.xyxy, tf.players.tracker_id):
+                        stable_id = id_mapping.get(int(tid), int(tid))
+                        self.team_separator.add_sample(stable_id, frame, box)
+
+                self.team_separator.cluster(frame_index)
+                id_to_team = {
+                    sid: self.team_separator.get_team(sid)
+                    for sid in id_mapping.values()
+                }
+
+                # ── Speed + Heatmap ───────────────────────────────────────
                 player_world: dict = {}
                 for tid, (cx, cy) in tf.player_centers.items():
                     stable_id = id_mapping.get(int(tid), int(tid))
-
-                    if self.calibrator.is_calibrated:
-                        wx, wy = self.calibrator.to_world(cx, cy)
-                    else:
-                        wx, wy = cx / W * 105, cy / H * 68
-
+                    wx = cx / W * 105 if not self.calibrator.is_calibrated \
+                         else self.calibrator.to_world(cx, cy)[0]
+                    wy = cy / H * 68  if not self.calibrator.is_calibrated \
+                         else self.calibrator.to_world(cx, cy)[1]
                     player_world[stable_id] = (wx, wy)
                     self.speed_analyzer.update(stable_id, cx, cy, timestamp_s)
                     self.heatmap_gen.add_position(stable_id, wx, wy)
@@ -149,17 +161,25 @@ class FootballPipeline:
                 ball_world = None
                 if tf.ball_center:
                     bcx, bcy = tf.ball_center
-                    if self.calibrator.is_calibrated:
-                        ball_world = self.calibrator.to_world(bcx, bcy)
-                    else:
-                        ball_world = (bcx / W * 105, bcy / H * 68)
+                    ball_world = (bcx / W * 105, bcy / H * 68) \
+                        if not self.calibrator.is_calibrated \
+                        else self.calibrator.to_world(bcx, bcy)
+
+                # ── Possession ────────────────────────────────────────────
+                if ball_world and player_world:
+                    closest = min(player_world,
+                        key=lambda sid: (
+                            (player_world[sid][0] - ball_world[0])**2 +
+                            (player_world[sid][1] - ball_world[1])**2
+                        ))
+                    self.team_separator.update_possession(closest)
 
                 # ── Events ────────────────────────────────────────────────
                 events = self.event_detector.update(
-                    frame_index             = frame_index,
-                    timestamp_s             = timestamp_s,
-                    ball_world              = ball_world,
-                    player_world_positions  = player_world,
+                    frame_index            = frame_index,
+                    timestamp_s            = timestamp_s,
+                    ball_world             = ball_world,
+                    player_world_positions = player_world,
                 )
                 recent_events = (recent_events + events)[-5:]
 
@@ -168,12 +188,12 @@ class FootballPipeline:
                         and frame_index % self.cfg.tactical_interval == 0
                         and ball_world and player_world):
                     situation = TacticalSituation(
-                        ball_position       = ball_world,
-                        possessor_id        = list(player_world.keys())[0],
-                        teammate_positions  = list(player_world.values()),
-                        opponent_positions  = [],
-                        frame_index         = frame_index,
-                        timestamp_s         = timestamp_s,
+                        ball_position      = ball_world,
+                        possessor_id       = list(player_world.keys())[0],
+                        teammate_positions = list(player_world.values()),
+                        opponent_positions = [],
+                        frame_index        = frame_index,
+                        timestamp_s        = timestamp_s,
                     )
                     advice = self.tactical_coach.analyse_sync(situation)
                     self._tactical_log.append({
@@ -194,18 +214,23 @@ class FootballPipeline:
                     ball_center      = tf.ball_center,
                     events           = recent_events if recent_events else None,
                     player_positions = player_world if player_world else None,
+                    id_to_team       = id_to_team,
+                    possession       = self.team_separator.get_possession(),
+                    id_mapping       = id_mapping,
                 )
                 writer.write(annotated)
 
                 if frame_index % 50 == 0:
-                    unique = self.reid.total_unique_players()
+                    unique  = self.reid.total_unique_players()
                     elapsed = time.time() - start_time
+                    poss    = self.team_separator.get_possession()
                     print(f"  Frame {frame_index:5d} | "
                           f"{timestamp_s:6.1f}s | "
                           f"Players: {len(tf.player_centers):2d} | "
-                          f"Unique IDs: {unique:3d} | "
+                          f"Unique: {unique:3d} | "
                           f"Ball: {'✓' if ball_world else '✗'} | "
-                          f"Elapsed: {elapsed:.1f}s")
+                          f"A:{poss['Team A']:.0f}% B:{poss['Team B']:.0f}% | "
+                          f"{elapsed:.1f}s")
 
                 frame_index += 1
 
@@ -221,7 +246,6 @@ class FootballPipeline:
                 self.cfg.heatmap_dir,
                 list(set(self.speed_analyzer.all_stats().keys())),
             )
-
         if self.cfg.save_report:
             Path(self.cfg.report_path).parent.mkdir(parents=True, exist_ok=True)
             with open(self.cfg.report_path, "w") as f:
@@ -239,21 +263,23 @@ class FootballPipeline:
             )
         else:
             print("[Pipeline] No calibration points supplied. Using approx "
-                  "full-frame mapping. Pass pixel_pts + world_pts for accurate "
-                  "speed/distance.")
+                  "full-frame mapping.")
         return calib
 
     def _build_report(self, total_frames: int, fps: float) -> dict:
-        duration_s = total_frames / fps
+        poss = self.team_separator.get_possession()
         return {
-            "video":            self.cfg.video_path,
-            "duration_s":       round(duration_s, 1),
-            "total_frames":     total_frames,
-            "unique_players":   self.reid.total_unique_players(),
-            "speed_stats":      self.speed_analyzer.summary_table(),
-            "events":           dict(self.event_detector.get_summary()),
-            "tactical_log":     self._tactical_log[-20:],
-            "formation":        self.heatmap_gen.detect_formation(
-                                    list(self.speed_analyzer.all_stats().keys())
-                                ),
+            "video":          self.cfg.video_path,
+            "duration_s":     round(total_frames / fps, 1),
+            "total_frames":   total_frames,
+            "unique_players": self.reid.total_unique_players(),
+            "possession":     poss,
+            "team_a_players": self.team_separator.get_team_players(0),
+            "team_b_players": self.team_separator.get_team_players(1),
+            "speed_stats":    self.speed_analyzer.summary_table(),
+            "events":         dict(self.event_detector.get_summary()),
+            "tactical_log":   self._tactical_log[-20:],
+            "formation":      self.heatmap_gen.detect_formation(
+                                  list(self.speed_analyzer.all_stats().keys())
+                              ),
         }
