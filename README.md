@@ -463,6 +463,5 @@ MIT License — free to use, modify, and distribute.
 
 ## 👨‍💻 Author
 
-Built as a graduation project demonstrating the application of computer vision, deep learning, and AI to sports analytics.
+Mina Nagy Sobhy
 
-> *"The best teams in the world use data. Now you can too."*
